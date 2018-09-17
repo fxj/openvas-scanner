@@ -43,7 +43,36 @@
 #include "nasl_cmd_exec.h"
 #include "nasl_debug.h"
 
+/* MAXPATHLEN doesn't exist on some architectures like hurd i386 */
+#ifndef MAXPATHLEN
+#define MAXPATHLEN 4096
+#endif
+
 static pid_t pid = 0;
+
+static char *
+pread_streams (int fdin, int fderr)
+{
+  char buf[8192];
+  GString *str;
+
+  str = g_string_new ("");
+  errno = 0;
+  bzero (buf, sizeof (buf));
+  while ((read (fdin, buf, sizeof (buf))) > 0
+         || read (fderr, buf, sizeof (buf)) > 0 || errno == EINTR)
+    {
+      if (errno == EINTR)
+        {
+          errno = 0;
+          continue;
+        }
+      g_string_append (str, buf);
+      bzero (buf, sizeof (buf));
+    }
+
+  return g_string_free (str, FALSE);
+}
 
 /** @todo Supspects to glib replacements, all path related stuff. */
 tree_cell *
@@ -52,9 +81,8 @@ nasl_pread (lex_ctxt * lexic)
   tree_cell *retc = NULL, *a;
   anon_nasl_var *v;
   nasl_array *av;
-  int i, j, n, sz, sz2, cd, fd = 0;
-  char **args = NULL, *cmd, *str, *str2, buf[8192];
-  FILE *fp;
+  int i, j, n, cd, fdin = 0, fderr = 0;
+  char **args = NULL, *cmd, *str;
   char cwd[MAXPATHLEN], newdir[MAXPATHLEN], key[128];
 
   if (pid != 0)
@@ -139,46 +167,27 @@ nasl_pread (lex_ctxt * lexic)
   args[j] = NULL;
 
   if (g_spawn_async_with_pipes
-       (NULL, args, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, &pid, NULL, &fd,
-        NULL, NULL) == FALSE)
+       (NULL, args, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, &pid, NULL, &fdin,
+        &fderr, NULL) == FALSE)
     goto finish_pread;
 
   snprintf (key, sizeof (key), "internal/child/%d", getpid ());
   kb_item_set_int (lexic->script_infos->key, key, pid);
-  fp = fdopen (fd, "r");
-
-  if (fp != NULL)
+  str = pread_streams (fdin, fderr);
+  if (str)
     {
-      sz = 0;
-      str = g_malloc0 (1);
-
-      errno = 0;
-      while ((n = fread (buf, 1, sizeof (buf), fp)) > 0 || errno == EINTR)      /* && kill(pid, 0) >= 0) */
-        {
-          if (errno == EINTR)
-            {
-              errno = 0;
-              continue;
-            }
-          sz2 = sz + n;
-          str2 = g_realloc (str, sz2);
-          str = str2;
-          memcpy (str + sz, buf, n);
-          sz = sz2;
-        }
-      if (ferror (fp) && errno != EINTR)
-        nasl_perror (lexic, "nasl_pread: fread(): %s\n", strerror (errno));
-
-      if (*cwd != '\0')
-        if (chdir (cwd) < 0)
-          nasl_perror (lexic, "pread(): chdir(%s): %s\n", cwd,
-                       strerror (errno));
-
       retc = alloc_typed_cell (CONST_DATA);
       retc->x.str_val = str;
-      retc->size = sz;
-      fclose (fp);
+      retc->size = strlen (str);
     }
+  else if (errno && errno != EINTR)
+    nasl_perror (lexic, "nasl_pread: fread(): %s\n", strerror (errno));
+  close (fdin);
+  if (*cwd != '\0')
+    if (chdir (cwd) < 0)
+      nasl_perror (lexic, "pread(): chdir(%s): %s\n", cwd,
+                   strerror (errno));
+
 
 finish_pread:
   for (i = 0; i < n; i++)
@@ -223,12 +232,9 @@ tree_cell *
 nasl_fread (lex_ctxt * lexic)
 {
   tree_cell *retc;
-  char *fname;
-  struct stat lstat_info, fstat_info;
-  int fd;
-  char *buf, *p;
-  int alen, len, n;
-  FILE *fp;
+  char *fname, *fcontent;
+  size_t flen;
+  GError *ferror = NULL;
 
   fname = get_str_var_by_num (lexic, 0);
   if (fname == NULL)
@@ -237,82 +243,17 @@ nasl_fread (lex_ctxt * lexic)
       return NULL;
     }
 
-  if (lstat (fname, &lstat_info) == -1)
+  if (!g_file_get_contents (fname, &fcontent, &flen, &ferror))
     {
-      if (errno != ENOENT)
-        {
-          nasl_perror (lexic, "fread: %s: %s\n", fname, strerror (errno));
-          return NULL;
-        }
-      fd = open (fname, O_RDONLY | O_EXCL, 0600);
-      if (fd < 0)
-        {
-          nasl_perror (lexic, "fread: %s: %s\n", fname, strerror (errno));
-          return NULL;
-        }
-    }
-  else
-    {
-      fd = open (fname, O_RDONLY | O_EXCL, 0600);
-      if (fd < 0)
-        {
-          nasl_perror (lexic, "fread: %s: possible symlink attack!?! %s\n",
-                       fname, strerror (errno));
-          return NULL;
-        }
-      if (fstat (fd, &fstat_info) == -1)
-        {
-          close (fd);
-          nasl_perror (lexic, "fread: %s: possible symlink attack!?! %s\n",
-                       fname, strerror (errno));
-          return NULL;
-        }
-      else
-        {
-          if (lstat_info.st_mode != fstat_info.st_mode
-              || lstat_info.st_ino != fstat_info.st_ino
-              || lstat_info.st_dev != fstat_info.st_dev)
-            {
-              close (fd);
-              nasl_perror (lexic, "fread: %s: possible symlink attack!?!\n",
-                           fname);
-              return NULL;
-            }
-        }
-    }
-  fp = fdopen (fd, "r");
-  if (fp == NULL)
-    {
-      close (fd);
-      nasl_perror (lexic, "fread: %s: %s\n", fname, strerror (errno));
+      nasl_perror (lexic, "fread: %s", ferror ? ferror->message : "Error");
+      if (ferror)
+        g_error_free (ferror);
       return NULL;
     }
 
-  alen = lstat_info.st_size + 1;
-  buf = g_malloc0 (alen);
-  len = 0;
-  while ((n = fread (buf + len, 1, alen - len, fp)) > 0)
-    {
-      len += n;
-      if (alen <= len)
-        {
-          alen += 4096;
-          p = g_realloc (buf, alen);
-          buf = p;
-        }
-    }
-
-  buf[len] = '\0';
-  if (alen > len + 1)
-    {
-      p = g_realloc (buf, len + 1);
-      buf = p;
-    }
-
   retc = alloc_typed_cell (CONST_DATA);
-  retc->size = len;
-  retc->x.str_val = buf;
-  fclose (fp);
+  retc->size = flen;
+  retc->x.str_val = fcontent;
   return retc;
 }
 
@@ -352,100 +293,28 @@ tree_cell *
 nasl_fwrite (lex_ctxt * lexic)
 {
   tree_cell *retc;
-  char *content, *fname;
-  struct stat lstat_info, fstat_info;
-  int fd;
-  int len, i, x;
-  FILE *fp;
+  char *fcontent, *fname;
+  size_t flen;
+  GError *ferror = NULL;
 
-  content = get_str_local_var_by_name (lexic, "data");
+  fcontent = get_str_local_var_by_name (lexic, "data");
   fname = get_str_local_var_by_name (lexic, "file");
-  if (content == NULL || fname == NULL)
+  if (!fcontent || !fname)
     {
       nasl_perror (lexic, "fwrite: need two arguments 'data' and 'file'\n");
       return NULL;
     }
-  len = get_var_size_by_name (lexic, "data");
+  flen = get_var_size_by_name (lexic, "data");
 
-  if (lstat (fname, &lstat_info) == -1)
+  if (!g_file_set_contents (fname, fcontent, flen, &ferror))
     {
-      if (errno != ENOENT)
-        {
-          nasl_perror (lexic, "fwrite: %s: %s\n", fname, strerror (errno));
-          return NULL;
-        }
-      fd = open (fname, O_WRONLY | O_CREAT | O_EXCL, 0600);
-      if (fd < 0)
-        {
-          nasl_perror (lexic, "fwrite: %s: %s\n", fname, strerror (errno));
-          return NULL;
-        }
-    }
-  else
-    {
-      fd = open (fname, O_WRONLY | O_CREAT, 0600);
-      if (fd < 0)
-        {
-          nasl_perror (lexic, "fwrite: %s: possible symlink attack!?! %s\n",
-                       fname, strerror (errno));
-          return NULL;
-        }
-      if (fstat (fd, &fstat_info) == -1)
-        {
-          close (fd);
-          nasl_perror (lexic, "fwrite: %s: possible symlink attack!?! %s\n",
-                       fname, strerror (errno));
-          return NULL;
-        }
-      else
-        {
-          if (lstat_info.st_mode != fstat_info.st_mode
-              || lstat_info.st_ino != fstat_info.st_ino
-              || lstat_info.st_dev != fstat_info.st_dev)
-            {
-              close (fd);
-              nasl_perror (lexic, "fwrite: %s: possible symlink attack!?!\n",
-                           fname);
-              return NULL;
-            }
-        }
-    }
-  if (ftruncate (fd, 0) == -1)
-    {
-      close (fd);
-      nasl_perror (lexic, "fwrite: %s: %s\n", fname, strerror (errno));
-      return NULL;
-    }
-  fp = fdopen (fd, "w");
-  if (fp == NULL)
-    {
-      close (fd);
-      nasl_perror (lexic, "fwrite: %s: %s\n", fname, strerror (errno));
-      return NULL;
-    }
-
-  for (i = 0; i < len;)
-    {
-      x = fwrite (content + i, 1, len - i, fp);
-      if (x > 0)
-        i += x;
-      else
-        {
-          nasl_perror (lexic, "fwrite: %s: %s\n", fname, strerror (errno));
-          (void) fclose (fp);
-          unlink (fname);
-          return NULL;
-        }
-    }
-
-  if (fclose (fp) < 0)
-    {
-      nasl_perror (lexic, "fwrite: %s: %s\n", fname, strerror (errno));
-      unlink (fname);
+      nasl_perror (lexic, "fwrite: %s", ferror ? ferror->message : "Error");
+      if (ferror)
+        g_error_free (ferror);
       return NULL;
     }
   retc = alloc_typed_cell (CONST_INT);
-  retc->x.i_val = len;
+  retc->x.i_val = flen;
   return retc;
 }
 
